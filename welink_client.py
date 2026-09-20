@@ -33,12 +33,12 @@ class WeLinkClient:
 
     async def _ensure(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            # Only the key is a session-wide header. The content type belongs
+            # to the request: json for the ordinary calls, multipart for an
+            # upload, and forcing one here would break the other.
             self._session = aiohttp.ClientSession(
                 timeout=self._timeout,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Authorization": f"Bearer {self.api_key}"},
             )
         return self._session
 
@@ -124,27 +124,59 @@ class WeLinkClient:
             "POST", f"/accounts/{account_id}/messages/text", body=body
         )
 
-    async def send_image(self, account_id: str, to: str, url: str) -> Any:
+    async def send_image(self, account_id: str, to: str, **what: str) -> Any:
+        """what is either url=... or media_id=..., whichever the caller has."""
         return await self.call(
-            "POST",
-            f"/accounts/{account_id}/messages/image",
-            body={"to": to, "url": url},
+            "POST", f"/accounts/{account_id}/messages/image",
+            body={"to": to, **what},
         )
 
     async def send_file(
-        self, account_id: str, to: str, url: str, filename: str | None = None
+        self, account_id: str, to: str, filename: str | None = None, **what: str
     ) -> Any:
-        body: dict[str, Any] = {"to": to, "url": url}
+        body: dict[str, Any] = {"to": to, **what}
         if filename:
             body["filename"] = filename
         return await self.call(
             "POST", f"/accounts/{account_id}/messages/file", body=body
         )
 
-    async def send_voice(self, account_id: str, to: str, url: str) -> Any:
+    async def send_voice(self, account_id: str, to: str, **what: str) -> Any:
         return await self.call(
-            "POST", f"/accounts/{account_id}/messages/voice", body={"to": to, "url": url}
+            "POST", f"/accounts/{account_id}/messages/voice", body={"to": to, **what},
         )
+
+    async def upload(
+        self,
+        account_id: str,
+        filename: str,
+        content_type: str,
+        body: bytes,
+    ) -> str | None:
+        """Hand the bytes over and get a handle back.
+
+        This is what removes the need for AstrBot to publish local files at
+        all: a picture the model just produced goes straight up, and the send
+        that follows names it by handle.
+        """
+        form = aiohttp.FormData()
+        form.add_field("file", body, filename=filename or "file",
+                       content_type=content_type or "application/octet-stream")
+        session = await self._ensure()
+        url = f"{self.base_url}/accounts/{account_id}/media/upload"
+        async with session.post(url, data=form) as resp:
+            try:
+                payload = await resp.json(content_type=None)
+            except Exception as exc:
+                text = (await resp.text())[:200]
+                raise WeLinkError(resp.status, f"上传返回的不是 JSON：{text}") from exc
+        if not isinstance(payload, dict) or payload.get("code") != 0:
+            raise WeLinkError(
+                int(payload.get("code") or resp.status) if isinstance(payload, dict) else resp.status,
+                str((payload or {}).get("message", "")),
+                str((payload or {}).get("request_id", "")),
+            )
+        return ((payload.get("data") or {}).get("media_id")) or None
 
     async def media_url(self, account_id: str, message_id: str) -> str | None:
         """Ask for a downloadable address for the media on an inbound message."""

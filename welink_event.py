@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import mimetypes
+import os
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import At, File, Image, Plain, Record
@@ -9,11 +12,6 @@ from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
 from .welink_client import WeLinkClient, WeLinkError
 
-
-_LOCAL_FILE_HINT = (
-    "本地文件要先配置 callback_api_base，而且那个地址必须是 WeLink 服务端"
-    "能访问到的——它是去下载，不是你上传给它。"
-)
 
 
 class WeLinkMessageEvent(AstrMessageEvent):
@@ -102,53 +100,72 @@ class WeLinkMessageEvent(AstrMessageEvent):
             out.append(getattr(comp, "file", None) or "")
         return [c for c in out if isinstance(c, str)]
 
-    async def _resolve_url(self, comp) -> str | None:
-        """Get an address the WeLink server can fetch.
+    async def _attachment(self, comp) -> dict[str, str] | None:
+        """Work out how to name this file to the platform.
 
-        WeLink takes a URL and downloads it itself; it has no upload endpoint.
-        So a component already holding an http(s) address is used as it is,
-        and a local file has to be published first. AstrBot's own file service
-        does that — but only when callback_api_base is set, and only to an
-        address the WeLink server can actually reach.
-
-        Image, Record, Video and File all carry register_to_file_service(),
-        so publishing is one call; only the http shortcut comes first.
+        An address it can already fetch is passed straight through. Anything
+        else is read off disk and uploaded, and the send names the handle
+        that comes back. That is the whole reason this adapter no longer
+        needs callback_api_base: nothing has to be reachable from outside.
         """
         for cand in self._candidate_urls(comp):
             if cand.startswith(("http://", "https://")):
-                return cand
+                return {"url": cand}
 
         try:
-            return await comp.register_to_file_service()
+            path = await comp.convert_to_file_path()
         except Exception as e:
-            logger.error("WeLink 发布本地文件失败：%s。%s", e, _LOCAL_FILE_HINT)
+            logger.error("WeLink 读不到这个文件，这一段没发出去：%s", e)
             return None
 
+        try:
+            with open(path, "rb") as fh:
+                body = fh.read()
+        except OSError as e:
+            logger.error("WeLink 读不到这个文件，这一段没发出去：%s", e)
+            return None
+        if not body:
+            logger.error("WeLink 这个文件是空的，没发")
+            return None
+
+        name = os.path.basename(path) or "file"
+        try:
+            media_id = await self.client.upload(
+                self.account_id, name, mimetypes.guess_type(name)[0] or "", body
+            )
+        except WeLinkError as e:
+            logger.error("WeLink 上传失败，这一段没发出去：%s", e)
+            return None
+        if not media_id:
+            logger.error("WeLink 上传没拿到 media_id，这一段没发出去")
+            return None
+        return {"media_id": media_id}
+
     async def _send_image(self, comp, to: str) -> None:
-        url = await self._resolve_url(comp)
-        if not url:
+        what = await self._attachment(comp)
+        if not what:
             return
         try:
-            await self.client.send_image(self.account_id, to, url)
+            await self.client.send_image(self.account_id, to, **what)
         except WeLinkError as e:
             logger.error("WeLink 发送图片失败：%s", e)
 
     async def _send_file(self, comp, to: str) -> None:
-        url = await self._resolve_url(comp)
-        if not url:
+        what = await self._attachment(comp)
+        if not what:
             return
         try:
             await self.client.send_file(
-                self.account_id, to, url, getattr(comp, "name", None)
+                self.account_id, to, getattr(comp, "name", None), **what
             )
         except WeLinkError as e:
             logger.error("WeLink 发送文件失败：%s", e)
 
     async def _send_media(self, comp, to: str, sender, label: str) -> None:
-        url = await self._resolve_url(comp)
-        if not url:
+        what = await self._attachment(comp)
+        if not what:
             return
         try:
-            await sender(self.account_id, to, url)
+            await sender(self.account_id, to, **what)
         except WeLinkError as e:
             logger.error("WeLink 发送%s失败：%s", label, e)
