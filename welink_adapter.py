@@ -17,7 +17,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Image, Plain
+from astrbot.api.message_components import At, Image, Plain
 from astrbot.api.platform import (
     AstrBotMessage,
     MessageMember,
@@ -60,6 +60,58 @@ SYSTEM_ACCOUNTS = frozenset({
 # and how long the chat is ignored once it goes over.
 LOOP_WINDOW = 60.0
 LOOP_PAUSE = 180.0
+
+
+# What WeChat puts after a name it inserted with @: a four-per-em space, not
+# an ordinary one. Stripping the mention has to know it.
+MENTION_SEP = "\u2005"
+
+
+def wake_prefixes() -> list[str]:
+    """The prefixes AstrBot answers to in a group, as its own settings say.
+
+    Read each time rather than once, so a change in the WebUI applies at
+    once. Should the settings not be reachable, "/" is what AstrBot ships
+    with.
+    """
+    try:
+        from astrbot.core import astrbot_config
+
+        prefixes = astrbot_config.get("wake_prefix") or []
+    except Exception:
+        prefixes = []
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    return [p for p in prefixes if isinstance(p, str) and p] or ["/"]
+
+
+def strip_self_mention(text: str, names: set[str], alone: bool) -> str:
+    """Take the "@bot" out of a message that mentions the bot.
+
+    WeChat writes the mention into the text as "@name" and a four-per-em
+    space. AstrBot recognises a command only when the text starts with its
+    prefix, so "@ink /help" has to reach it as "/help", with the mention
+    carried alongside as an At instead.
+
+    The name is the one the bot has in that group, which is not always its
+    nickname. When none of the names we know matches and the bot is the only
+    one mentioned, the leading mention must be it, whatever it is called.
+    """
+    out = text
+    for name in names:
+        if not name:
+            continue
+        tag = "@" + name
+        for sep in (MENTION_SEP, " "):
+            out = out.replace(tag + sep, "")
+        trimmed = out.rstrip()
+        if trimmed.endswith(tag):
+            out = trimmed[: -len(tag)]
+    if out == text and alone and text.startswith("@"):
+        cut = text.find(MENTION_SEP)
+        if cut > 0:
+            out = text[cut + 1 :]
+    return out.strip()
 
 
 def from_wechat_itself(chat_id: str, sender: str) -> bool:
@@ -125,6 +177,9 @@ class WeLinkPlatformAdapter(Platform):
         self._cursor: str | None = None
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._triggers: dict[str, deque[float]] = {}
+        # Who the bot is in WeChat: its wxid, and the names people @ it by.
+        self._self_wxid = ""
+        self._self_names: set[str] = set()
         self._paused_until: dict[str, float] = {}
         self._stop = asyncio.Event()
 
@@ -199,21 +254,29 @@ class WeLinkPlatformAdapter(Platform):
             self.record_error(str(e))
             return False
 
-        if self.account_id:
-            return True
-        if not accounts:
-            logger.error("WeLink 这个 Key 下面一个实例都没有，先去控制台扫码登录一个")
-            self.record_error("没有可用的实例")
-            return False
+        if not self.account_id:
+            if not accounts:
+                logger.error("WeLink 这个 Key 下面一个实例都没有，先去控制台扫码登录一个")
+                self.record_error("没有可用的实例")
+                return False
+            online = [a for a in accounts if a.get("status") == "online"]
+            chosen = (online or accounts)[0]
+            self.account_id = chosen.get("account_id", "")
+            logger.info(
+                "WeLink 没有指定 account_id，自动选了 %s（%s）",
+                self.account_id,
+                chosen.get("name") or chosen.get("status"),
+            )
 
-        online = [a for a in accounts if a.get("status") == "online"]
-        chosen = (online or accounts)[0]
-        self.account_id = chosen.get("account_id", "")
-        logger.info(
-            "WeLink 没有指定 account_id，自动选了 %s（%s）",
-            self.account_id,
-            chosen.get("name") or chosen.get("status"),
-        )
+        # The bot's own wxid and nickname, for recognising "@bot" in groups.
+        # Each message also names the receiving account, so this is only
+        # the starting point.
+        for a in accounts:
+            if a.get("account_id") == self.account_id:
+                profile = a.get("profile") or {}
+                self._self_wxid = str(profile.get("wxid") or "")
+                if profile.get("nickname"):
+                    self._self_names.add(str(profile["nickname"]))
         return bool(self.account_id)
 
     # --- polling ----------------------------------------------------------
@@ -293,18 +356,21 @@ class WeLinkPlatformAdapter(Platform):
         if from_wechat_itself(str(data.get("chat_id") or ""), str(data.get("sender") or "")):
             return
 
-        abm = await self._convert(data)
-        if abm is None:
-            return
-
+        # Decided before converting: converting a picture asks the platform
+        # for a download address, and a group full of pictures nobody sent to
+        # the bot should not cost a request each.
         if (
-            abm.type == MessageType.GROUP_MESSAGE
+            data.get("is_group")
             and self.group_reply_needs_at
-            and not data.get("mentions_me")
+            and not self._addressed_in_group(data)
         ):
             return
 
-        if self._looping(abm.session_id):
+        if self._looping(str(data.get("chat_id") or "")):
+            return
+
+        abm = await self._convert(data)
+        if abm is None:
             return
 
         self.commit_event(
@@ -318,6 +384,18 @@ class WeLinkPlatformAdapter(Platform):
                 chat_id=data.get("chat_id", ""),
             )
         )
+
+    def _addressed_in_group(self, data: dict[str, Any]) -> bool:
+        """Whether a group message is meant for the bot.
+
+        Either it @s the bot, or it starts with one of AstrBot's wake
+        prefixes. The second used to be missing, and a plain "/help" in a
+        group never reached AstrBot at all.
+        """
+        if data.get("mentions_me"):
+            return True
+        text = str(data.get("text") or "").lstrip()
+        return any(text.startswith(p) for p in wake_prefixes())
 
     def _looping(self, chat_id: str) -> bool:
         """Whether this chat has set the bot off too often to be a person.
@@ -360,9 +438,16 @@ class WeLinkPlatformAdapter(Platform):
         kind = data.get("type") or "text"
         text = data.get("text") or ""
 
+        # The bot's own wxid, not the instance id: AstrBot takes an At as
+        # addressed to the bot only when the two are the same, and people
+        # @ the wxid. Every inbound message names it as the recipient.
+        self_wxid = str(data.get("to") or "") or self._self_wxid
+        if self_wxid:
+            self._self_wxid = self_wxid
+
         abm = AstrBotMessage()
         abm.type = MessageType.GROUP_MESSAGE if is_group else MessageType.FRIEND_MESSAGE
-        abm.self_id = self.account_id
+        abm.self_id = self_wxid or self.account_id
         abm.message_id = str(data.get("message_id") or "")
         abm.session_id = str(chat_id)
         abm.sender = MessageMember(user_id=str(data.get("sender") or data.get("from") or ""))
@@ -371,8 +456,18 @@ class WeLinkPlatformAdapter(Platform):
         if is_group:
             abm.group_id = str(chat_id)
 
+        # In a group, an @ to the bot goes to AstrBot as an At in front, and
+        # the "@name" comes out of the text. Otherwise AstrBot sees a message
+        # that neither starts with its prefix nor carries an At for it, and
+        # ignores it — which is what every "@bot /help" in a group got.
+        mention: list[Any] = []
+        if is_group and data.get("mentions_me") and abm.self_id:
+            mentions = [str(m) for m in (data.get("mentions") or [])]
+            text = strip_self_mention(text, self._self_names, mentions == [abm.self_id])
+            mention = [At(qq=abm.self_id, name=next(iter(self._self_names), ""))]
+
         if kind == "text":
-            abm.message = [Plain(text)]
+            abm.message = mention + [Plain(text)]
             abm.message_str = text
             return abm
 
@@ -383,7 +478,7 @@ class WeLinkPlatformAdapter(Platform):
             except WeLinkError as e:
                 logger.warning("WeLink 取图片地址失败，当作文字处理：%s", e)
             if url:
-                abm.message = [Image.fromURL(url)]
+                abm.message = mention + [Image.fromURL(url)]
                 abm.message_str = text or ""
                 return abm
 
@@ -391,7 +486,7 @@ class WeLinkPlatformAdapter(Platform):
         # something arrived rather than seeing an empty turn.
         label = KIND_LABEL.get(kind, f"[{kind}]")
         body = f"{label}{text}" if text else label
-        abm.message = [Plain(body)]
+        abm.message = mention + [Plain(body)]
         abm.message_str = body
         return abm
 
