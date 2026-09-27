@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +33,10 @@ from .welink_event import WeLinkMessageEvent
 
 # Message kinds that carry a file rather than text.
 MEDIA_KINDS = {"image", "voice", "video", "file", "sticker"}
+
+# How many handled events to remember, to never answer the same one twice.
+# A poll returns at most 200; this covers the last several of them.
+SEEN_MAX = 2000
 
 # What to show the model in place of media it cannot see.
 KIND_LABEL = {
@@ -83,6 +88,7 @@ class WeLinkPlatformAdapter(Platform):
 
         self.client = WeLinkClient(self.base_url, self.api_key)
         self._cursor: str | None = None
+        self._seen: OrderedDict[str, None] = OrderedDict()
         self._stop = asyncio.Event()
 
     # --- lifecycle --------------------------------------------------------
@@ -124,9 +130,13 @@ class WeLinkPlatformAdapter(Platform):
         backoff = self.poll_interval
         while not self._stop.is_set():
             try:
-                await self._poll_once(since if self._cursor is None else None)
+                more = await self._poll_once(since if self._cursor is None else None)
                 self.clear_errors()
                 backoff = self.poll_interval
+                if more:
+                    # A full page: what is behind it has already happened, so
+                    # read it now rather than one interval late.
+                    continue
             except asyncio.CancelledError:
                 raise
             except WeLinkError as e:
@@ -171,7 +181,8 @@ class WeLinkPlatformAdapter(Platform):
 
     # --- polling ----------------------------------------------------------
 
-    async def _poll_once(self, since: str | None) -> None:
+    async def _poll_once(self, since: str | None) -> bool:
+        """Read one page and hand it on. Returns whether more is waiting."""
         data = await self.client.events(
             account_id=self.account_id,
             cursor=self._cursor,
@@ -184,16 +195,48 @@ class WeLinkPlatformAdapter(Platform):
         # The cursor only moves when something actually came back. An empty
         # page has confirmed nothing, so moving past it would step over a
         # message that had not arrived yet when the query ran.
+        #
+        # Where it moves to is the last event on the page. The platform says
+        # so in next_cursor, but versions before 2026-09-27 said it only for a
+        # full page: a short one came back with none, the cursor stayed put,
+        # and every poll returned the same messages — one "/help" answered
+        # every three seconds. The last event's own id is the same position,
+        # so it stands in whenever next_cursor is missing.
         if items:
-            nxt = data.get("next_cursor")
+            nxt = data.get("next_cursor") or items[-1].get("event_id")
             if nxt:
                 self._cursor = nxt
 
         for event in items:
+            if self._already_handled(event):
+                continue
             try:
                 await self._handle(event)
             except Exception as e:
                 logger.exception("WeLink 处理事件出错，跳过这一条：%s", e)
+
+        more = data.get("has_more")
+        if more is None:
+            more = len(items) >= self.poll_limit
+        return bool(more)
+
+    def _already_handled(self, event: dict[str, Any]) -> bool:
+        """Remember each event, and say whether it has been seen before.
+
+        The cursor is what keeps a page from being read twice; this is what
+        keeps a reply from being sent twice when something gets past the
+        cursor anyway — a replay, a retry, a platform that forgets to move it.
+        Answering twice is the one failure a chat bot cannot take back.
+        """
+        key = event.get("event_id") or (event.get("data") or {}).get("message_id")
+        if not key:
+            return False
+        if key in self._seen:
+            return True
+        self._seen[key] = None
+        if len(self._seen) > SEEN_MAX:
+            self._seen.popitem(last=False)
+        return False
 
     async def _handle(self, event: dict[str, Any]) -> None:
         if event.get("type") != "message.received":
