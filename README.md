@@ -8,7 +8,15 @@
 
 ## 装
 
-把这个目录放进 AstrBot 的 `data/plugins/`：
+需要 AstrBot 4.14.0 或更新的版本。两种装法，任选一种。
+
+**在 WebUI 里装**：插件 → 安装 → 「从链接安装」，填：
+
+```
+https://github.com/getwelink/astrbot_plugin_welink
+```
+
+**命令行装**：把这个目录放进 AstrBot 的 `data/plugins/`：
 
 ```bash
 cd data/plugins

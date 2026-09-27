@@ -1,5 +1,22 @@
 name: astrbot_plugin_welink
-desc: WeLink 微信个人号适配器。把一个微信个人号接成 AstrBot 的消息平台，轮询取消息，不需要公网地址。
-author: getwelink
+display_name: WeLink 微信个人号
+short_desc: 把微信个人号接进 AstrBot，私聊群聊都能用，不需要公网地址
+desc: |
+  WeLink 微信个人号适配器。装上后 AstrBot 的平台列表里会多出一个 welink，把一个微信个人号接成消息平台。
+
+  - 轮询取消息，不需要公网地址，家里的电脑、NAS、docker 都能直接用
+  - 私聊直接回；群里 @ 机器人，或者发 /help 这类命令才回
+  - 收发文字、图片、语音、文件，AI 生成的图片直接发出去，不用挂公网地址
+  - 同一条消息只回一次；不理微信团队和公众号的自动回复，也防着两个机器人互相回个没完
+
+  需要一个 WeLink 的 API Key，怎么拿见仓库说明。
 version: 0.1.3
+author: getwelink
 repo: https://github.com/getwelink/astrbot_plugin_welink
+astrbot_version: ">=4.14.0"
+social_link: https://github.com/getwelink/weLink
+tags:
+  - 微信
+  - 个人号
+  - 平台适配器
+  - WeChat
