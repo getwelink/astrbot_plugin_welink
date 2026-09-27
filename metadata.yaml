@@ -1,5 +1,5 @@
 name: astrbot_plugin_welink
 desc: WeLink 微信个人号适配器。把一个微信个人号接成 AstrBot 的消息平台，轮询取消息，不需要公网地址。
 author: getwelink
-version: 0.1.1
+version: 0.1.2
 repo: https://github.com/getwelink/astrbot_plugin_welink

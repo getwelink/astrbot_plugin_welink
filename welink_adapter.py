@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -38,6 +38,38 @@ MEDIA_KINDS = {"image", "voice", "video", "file", "sticker"}
 # A poll returns at most 200; this covers the last several of them.
 SEEN_MAX = 2000
 
+# Message kinds that are notices about a chat rather than something somebody
+# said in it: someone joined, a message was withdrawn, a friend request came
+# in. A bot that answers these talks to nobody — or to WeChat itself.
+NOTICE_KINDS = {"system", "revoke", "friend_request"}
+
+# Accounts that are WeChat rather than a person. The WeChat team account
+# answers anything sent to it with the same canned line, which the bot would
+# answer, which it would answer: 105 rounds in eight minutes before anyone
+# noticed. Official accounts (gh_...) auto-reply the same way.
+SYSTEM_ACCOUNTS = frozenset({
+    "weixin", "fmessage", "medianote", "floatbottle", "qqmail", "qmessage",
+    "qqsync", "tmessage", "newsapp", "notifymessage", "notification_messages",
+    "brandsessionholder", "brandservicesessionholder", "officialaccounts",
+    "mphelper", "voipnotify", "exmail_tool", "userexperience_alarm",
+    "helper_entry", "weibo", "qqfriend", "lbsapp", "shakeapp", "blogapp",
+    "masssendapp", "feedsapp", "cardpackage", "wxitil",
+})
+
+# The loop guard: the most times one chat may set the bot off in a minute,
+# and how long the chat is ignored once it goes over.
+LOOP_WINDOW = 60.0
+LOOP_PAUSE = 180.0
+
+
+def from_wechat_itself(chat_id: str, sender: str) -> bool:
+    """Whether a message comes from WeChat or an official account, not a person."""
+    for who in (chat_id, sender):
+        if who in SYSTEM_ACCOUNTS or who.startswith("gh_"):
+            return True
+    return False
+
+
 # What to show the model in place of media it cannot see.
 KIND_LABEL = {
     "image": "[图片]",
@@ -62,6 +94,7 @@ KIND_LABEL = {
         "poll_limit": 100,
         "download_image": True,
         "group_reply_needs_at": True,
+        "loop_guard_per_minute": 12,
     },
     adapter_display_name="WeLink 微信个人号",
     support_streaming_message=False,
@@ -85,10 +118,14 @@ class WeLinkPlatformAdapter(Platform):
         self.group_reply_needs_at = bool(
             platform_config.get("group_reply_needs_at", True)
         )
+        guard = platform_config.get("loop_guard_per_minute", 12)
+        self.loop_guard = max(0, int(12 if guard is None else guard))
 
         self.client = WeLinkClient(self.base_url, self.api_key)
         self._cursor: str | None = None
         self._seen: OrderedDict[str, None] = OrderedDict()
+        self._triggers: dict[str, deque[float]] = {}
+        self._paused_until: dict[str, float] = {}
         self._stop = asyncio.Event()
 
     # --- lifecycle --------------------------------------------------------
@@ -248,6 +285,14 @@ class WeLinkPlatformAdapter(Platform):
         if data.get("self"):
             return
 
+        # Notices, and anything from WeChat or an official account, are not
+        # somebody talking to the bot. Answering them starts a conversation
+        # with an auto-reply that never ends.
+        if (data.get("type") or "text") in NOTICE_KINDS:
+            return
+        if from_wechat_itself(str(data.get("chat_id") or ""), str(data.get("sender") or "")):
+            return
+
         abm = await self._convert(data)
         if abm is None:
             return
@@ -257,6 +302,9 @@ class WeLinkPlatformAdapter(Platform):
             and self.group_reply_needs_at
             and not data.get("mentions_me")
         ):
+            return
+
+        if self._looping(abm.session_id):
             return
 
         self.commit_event(
@@ -270,6 +318,38 @@ class WeLinkPlatformAdapter(Platform):
                 chat_id=data.get("chat_id", ""),
             )
         )
+
+    def _looping(self, chat_id: str) -> bool:
+        """Whether this chat has set the bot off too often to be a person.
+
+        The filters above catch the auto-replies we know of. This catches the
+        ones we do not — a friend's own bot, a shop's auto-responder — by the
+        one thing every such loop has in common: it goes faster than anybody
+        types. Past the limit the chat is left alone for a few minutes, which
+        breaks the loop, and a person who really was that quick loses nothing
+        but a short wait.
+        """
+        if not self.loop_guard or not chat_id:
+            return False
+        now = time.monotonic()
+        if now < self._paused_until.get(chat_id, 0.0):
+            return True
+        recent = self._triggers.setdefault(chat_id, deque())
+        recent.append(now)
+        while recent and now - recent[0] > LOOP_WINDOW:
+            recent.popleft()
+        if len(recent) > self.loop_guard:
+            recent.clear()
+            self._paused_until[chat_id] = now + LOOP_PAUSE
+            logger.warning(
+                "WeLink 会话 %s 一分钟内触发了机器人 %d 次以上，像是在和自动回复互相回，"
+                "先暂停 %d 分钟不理它",
+                chat_id,
+                self.loop_guard,
+                int(LOOP_PAUSE // 60),
+            )
+            return True
+        return False
 
     async def _convert(self, data: dict[str, Any]) -> AstrBotMessage | None:
         chat_id = data.get("chat_id")
