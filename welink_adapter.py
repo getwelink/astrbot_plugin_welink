@@ -137,7 +137,7 @@ KIND_LABEL = {
 
 @register_platform_adapter(
     "welink",
-    "WeLink 微信个人号适配器（轮询，不需要公网地址）",
+    "WeLink 微信个人号适配器，通过轮询获取消息，不需要公网地址",
     default_config_tmpl={
         "base_url": "",
         "api_key": "",
@@ -204,7 +204,7 @@ class WeLinkPlatformAdapter(Platform):
 
     async def run(self) -> None:
         if not self.base_url or not self.api_key:
-            logger.error("WeLink 适配器没有配置 base_url 或 api_key，不会启动")
+            logger.error("WeLink 适配器缺少 base_url 或 api_key，未启动")
             self.record_error("缺少 base_url 或 api_key")
             return
 
@@ -214,7 +214,7 @@ class WeLinkPlatformAdapter(Platform):
         # Start from now, so restarting the bot does not replay old chats.
         since = datetime.now(timezone.utc).isoformat()
         logger.info(
-            "WeLink 适配器开始轮询，实例 %s，间隔 %ds",
+            "WeLink 适配器已开始拉取消息，实例 %s，间隔 %d 秒",
             self.account_id,
             self.poll_interval,
         )
@@ -232,11 +232,11 @@ class WeLinkPlatformAdapter(Platform):
             except asyncio.CancelledError:
                 raise
             except WeLinkError as e:
-                logger.error("WeLink 拉取事件失败：%s", e)
+                logger.error("WeLink 拉取消息失败：%s", e)
                 self.record_error(str(e))
                 backoff = min(60, backoff * 2)
             except Exception as e:
-                logger.exception("WeLink 轮询出错：%s", e)
+                logger.exception("WeLink 拉取消息时出错：%s", e)
                 self.record_error(str(e))
                 backoff = min(60, backoff * 2)
 
@@ -250,20 +250,20 @@ class WeLinkPlatformAdapter(Platform):
         try:
             accounts = await self.client.accounts()
         except WeLinkError as e:
-            logger.error("WeLink 连不上或者 Key 不对：%s", e)
+            logger.error("无法连接 WeLink 服务，或 API Key 不正确：%s", e)
             self.record_error(str(e))
             return False
 
         if not self.account_id:
             if not accounts:
-                logger.error("WeLink 这个 Key 下面一个实例都没有，先去控制台扫码登录一个")
+                logger.error("这个 WeLink API Key 下没有任何实例，请先在 WeLink 控制台扫码登录一个微信号")
                 self.record_error("没有可用的实例")
                 return False
             online = [a for a in accounts if a.get("status") == "online"]
             chosen = (online or accounts)[0]
             self.account_id = chosen.get("account_id", "")
             logger.info(
-                "WeLink 没有指定 account_id，自动选了 %s（%s）",
+                "WeLink 未指定 account_id，已自动选择实例 %s（%s）",
                 self.account_id,
                 chosen.get("name") or chosen.get("status"),
             )
@@ -313,7 +313,7 @@ class WeLinkPlatformAdapter(Platform):
             try:
                 await self._handle(event)
             except Exception as e:
-                logger.exception("WeLink 处理事件出错，跳过这一条：%s", e)
+                logger.exception("WeLink 处理消息时出错，已跳过这条消息：%s", e)
 
         more = data.get("has_more")
         if more is None:
@@ -420,8 +420,8 @@ class WeLinkPlatformAdapter(Platform):
             recent.clear()
             self._paused_until[chat_id] = now + LOOP_PAUSE
             logger.warning(
-                "WeLink 会话 %s 一分钟内触发了机器人 %d 次以上，像是在和自动回复互相回，"
-                "先暂停 %d 分钟不理它",
+                "WeLink 会话 %s 在一分钟内触发机器人超过 %d 次，可能是在和其他自动回复互相回复，"
+                "暂停处理该会话 %d 分钟",
                 chat_id,
                 self.loop_guard,
                 int(LOOP_PAUSE // 60),
@@ -476,7 +476,7 @@ class WeLinkPlatformAdapter(Platform):
             try:
                 url = await self.client.media_url(self.account_id, abm.message_id)
             except WeLinkError as e:
-                logger.warning("WeLink 取图片地址失败，当作文字处理：%s", e)
+                logger.warning("WeLink 获取图片地址失败，已按文字消息处理：%s", e)
             if url:
                 abm.message = mention + [Image.fromURL(url)]
                 abm.message_str = text or ""

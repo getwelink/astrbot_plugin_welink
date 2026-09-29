@@ -65,10 +65,10 @@ class WeLinkClient:
                 payload = await resp.json(content_type=None)
             except Exception as exc:
                 text = (await resp.text())[:200]
-                raise WeLinkError(resp.status, f"返回的不是 JSON：{text}") from exc
+                raise WeLinkError(resp.status, f"服务返回的内容不是 JSON：{text}") from exc
 
         if not isinstance(payload, dict):
-            raise WeLinkError(resp.status, f"返回的结构不对：{payload!r}"[:200])
+            raise WeLinkError(resp.status, f"服务返回的数据格式不正确：{payload!r}"[:200])
 
         code = payload.get("code")
         if code != 0:
@@ -169,7 +169,7 @@ class WeLinkClient:
                 payload = await resp.json(content_type=None)
             except Exception as exc:
                 text = (await resp.text())[:200]
-                raise WeLinkError(resp.status, f"上传返回的不是 JSON：{text}") from exc
+                raise WeLinkError(resp.status, f"上传接口返回的内容不是 JSON：{text}") from exc
         if not isinstance(payload, dict) or payload.get("code") != 0:
             raise WeLinkError(
                 int(payload.get("code") or resp.status) if isinstance(payload, dict) else resp.status,

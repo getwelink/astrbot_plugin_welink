@@ -17,6 +17,6 @@ class Main(Star):
     def __init__(self, context: Context) -> None:
         self.context = context
         logger.info(
-            "WeLink 微信个人号适配器已加载。到「平台适配器」里新增一个 welink，"
-            "填上 base_url 和 api_key 即可。"
+            "WeLink 微信个人号适配器已加载。请在「平台适配器」中新增 welink 类型，"
+            "并填写 base_url 和 api_key。"
         )

@@ -66,7 +66,7 @@ class WeLinkMessageEvent(AstrMessageEvent):
                 await self._flush_text(to, text_parts, mentions)
                 await self._send_file(comp, to)
             else:
-                logger.debug("WeLink 适配器跳过了不支持的消息段：%s", type(comp).__name__)
+                logger.debug("WeLink 暂不支持发送这类消息，已跳过：%s", type(comp).__name__)
 
         await self._flush_text(to, text_parts, mentions)
 
@@ -115,17 +115,17 @@ class WeLinkMessageEvent(AstrMessageEvent):
         try:
             path = await comp.convert_to_file_path()
         except Exception as e:
-            logger.error("WeLink 读不到这个文件，这一段没发出去：%s", e)
+            logger.error("WeLink 无法读取文件，这部分内容未发送：%s", e)
             return None
 
         try:
             with open(path, "rb") as fh:
                 body = fh.read()
         except OSError as e:
-            logger.error("WeLink 读不到这个文件，这一段没发出去：%s", e)
+            logger.error("WeLink 无法读取文件，这部分内容未发送：%s", e)
             return None
         if not body:
-            logger.error("WeLink 这个文件是空的，没发")
+            logger.error("WeLink 文件内容为空，未发送")
             return None
 
         name = os.path.basename(path) or "file"
@@ -134,10 +134,10 @@ class WeLinkMessageEvent(AstrMessageEvent):
                 self.account_id, name, mimetypes.guess_type(name)[0] or "", body
             )
         except WeLinkError as e:
-            logger.error("WeLink 上传失败，这一段没发出去：%s", e)
+            logger.error("WeLink 文件上传失败，这部分内容未发送：%s", e)
             return None
         if not media_id:
-            logger.error("WeLink 上传没拿到 media_id，这一段没发出去")
+            logger.error("WeLink 文件上传后没有返回 media_id，这部分内容未发送")
             return None
         return {"media_id": media_id}
 
