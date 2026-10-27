@@ -2,7 +2,7 @@
 
 AstrBot 的微信个人号适配器。安装后，AstrBot 的「平台适配器」中会多出一个 `welink` 类型，可以把一个微信个人号接入 AstrBot，用法和 Telegram、Discord、企业微信等平台一样。
 
-插件通过轮询获取消息，不需要公网地址。家里的电脑、NAS 或 Docker 容器都可以直接运行，不用做端口映射，也不用准备域名。
+插件支持 WebSocket 实时收消息，也保留 HTTP 轮询。两种方式都不需要公网地址，家里的电脑、NAS 或 Docker 容器可以直接运行。
 
 ## 安装
 
@@ -34,13 +34,41 @@ git clone https://github.com/getwelink/astrbot_plugin_welink
 | `base_url` | WeLink 服务地址，例如 `https://你的地址`，末尾的 `/v1` 可以不写 |
 | `api_key` | 在 WeLink 控制台创建的 API Key，形如 `key_xxx` |
 | `account_id` | 要接入的微信实例。留空时会自动选择一个在线的实例 |
-| `poll_interval` | 拉取消息的间隔，单位为秒，默认 3 |
-| `poll_limit` | 每次最多拉取的消息数，默认 100，最大 200 |
+| `receive_mode` | `websocket` 或 `polling`。新建配置默认 WebSocket；旧配置未填写此字段时继续轮询 |
+| `poll_interval` | 仅轮询模式生效，拉取间隔秒数，默认 3 |
+| `poll_limit` | 轮询和断线 HTTP 补拉的每页条数，默认 100，最大 200 |
 | `download_image` | 收到图片时，是否转成下载地址交给模型，默认开启 |
 | `group_reply_needs_at` | 群聊中是否只处理 @ 机器人或以唤醒前缀开头的消息，默认开启 |
 | `loop_guard_per_minute` | 同一个会话每分钟最多触发机器人的次数，超过后暂停处理该会话 3 分钟。默认 12，填 0 表示不限制 |
 
-还没有 API Key 的话，可以[在这里申请](https://github.com/getwelink/weLink#怎么用起来免费)。
+API Key、实例与接口说明见 [WeLink 项目文档](https://github.com/getwelink/weLink)。
+
+### 使用 WebSocket
+
+1. 在 WeLink 控制台将对应实例的推送方式设为 **WebSocket**，解除它的 Webhook 绑定。同一实例的 WebSocket 与 Webhook 不能同时推送。
+2. 在 AstrBot 的 `welink` 平台配置中设置 `receive_mode` 为 `websocket`，填写 `base_url`、`api_key`。建议明确填写 `account_id`，避免自动选择到其他实例。
+3. 保存并重载适配器。`https` 地址自动使用 `wss`，`http` 地址使用 `ws`，不需要额外填写 WebSocket 地址。
+
+```json
+{
+  "base_url": "https://api.example.com",
+  "api_key": "YOUR_API_KEY",
+  "account_id": "acc_xxx",
+  "receive_mode": "websocket"
+}
+```
+
+每个适配器连接 `/v1/accounts/{account_id}/ws`，只处理该实例，不能把一个适配器当作所有微信号的聚合机器人。多个微信请分别配置适配器；这与平台账号级 `/v1/ws` 的聚合接收能力不同。
+
+正常连接时不定时轮询；首次连接、重连或收到 `gap` 时才通过 HTTP 事件接口补拉。协议 Ping/Pong 自动处理，接收循环与图片下载等消息处理分开运行。连接断开后以退避和随机抖动重连，最长基础等待 60 秒，限流时至少等待 30 秒。鉴权、实例访问、Webhook 模式冲突或服务不支持 WS 时停止并提示检查配置，不会静默切成另一种模式。
+
+断线恢复使用本进程最后交给 AstrBot 队列或按规则忽略的事件位置，**不代表模型已经完成回复，也不是服务端业务 ACK**。本地接收缓冲最多 256 条；积压过多会关闭连接并尝试 HTTP 补拉。事件去重覆盖最近 2000 条，跨通道补拉不会在此范围内重复入队。
+
+HTTP 补拉只能找回平台仍保存且当前用户可见的事件。关闭消息保存、记录已清理、事件从未落库等情况不能保证恢复；收到缺口会记录警告，不会把服务端 `resume_cursor` 当作本地已处理位置。未提供端到端严格不丢、恰好处理一次或跨重启续传保证。插件重启仍从启动时间开始，不补机器人停机前的历史聊天。
+
+### 保留轮询模式
+
+旧配置不填 `receive_mode`，或明确设置为 `polling`，即可继续使用现有 HTTP 轮询。`poll_interval` 仅在该模式下生效。若希望切换到 WebSocket，请按上面的步骤配置；仅升级插件不会强制改写旧配置。
 
 ## 功能
 
@@ -58,7 +86,7 @@ git clone https://github.com/getwelink/astrbot_plugin_welink
 
 **可以直接发送本地文件。** AI 生成的图片或本地磁盘上的文件，插件会先上传再发送，不需要配置 `callback_api_base`，也不需要公网地址。已经是 http(s) 链接的图片会直接发送。
 
-**同一条消息只处理一次。** 即使同一条消息被重复拉取，机器人也只会回复一次。
+**近期重复事件会去重。** 最近 2000 条事件在本进程中不重复入队，重连与补拉共用去重记录；重启会清空记录，不能作为跨重启的业务幂等保证。
 
 **不处理系统消息和自动回复账号。** 来自「微信团队」等微信系统账号和公众号（`gh_` 开头）的消息，以及进群退群提示、撤回通知、好友申请，都不会交给机器人。比如「微信团队」会对收到的任何消息自动回复"如果遇到问题，可轻触此处反馈给我"，如果机器人去回复它，双方就会一直来回发送。
 
@@ -73,9 +101,17 @@ cd data/plugins/astrbot_plugin_welink
 git pull
 ```
 
-然后在插件管理中点击「重载」，或重启 AstrBot。配置不需要修改。
+然后在插件管理中点击「重载」，或重启 AstrBot。旧配置继续轮询；切换 WebSocket 需设置 `receive_mode` 并调整 WeLink 实例推送方式。
 
 ## 更新记录
+
+**0.2.0（2026-10-27）**
+
+- 新增 WebSocket 接收，旧配置继续兼容 HTTP 轮询。
+- 自动处理协议心跳、断线重连及缺口 HTTP 补拉。
+- 接收与消息处理分开，下载图片期间也能响应心跳；接收缓冲有上限。
+- 处理失败不再提前推进游标，补拉和推送共用近期事件去重。
+- 更新接入步骤、恢复边界及模式冲突提示。
 
 **0.1.4（2026-09-29）**
 - 重新整理了说明文档和日志提示，读起来更清楚。功能没有变化。
@@ -94,6 +130,15 @@ git pull
 ## 风险提示
 
 微信用户协议不允许使用非官方客户端，这类工具都存在账号被限制的风险。容易触发风控的通常是明显像机器的行为，比如秒回、高频发送、批量加好友、群发广告。建议使用自己的账号，控制发送频率，重要的账号不要用来测试。
+
+## 开发验证
+
+```bash
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+测试使用本地 HTTP/WebSocket 服务和 AstrBot API 替身，覆盖心跳、重连、超过 199 条的缺口补拉、去重、缓冲上限、旧配置兼容和失败游标。已在 Python 3.12、aiohttp 3.9.5 与 3.14.3 下通过；不代替实际 AstrBot 与微信环境的联调。
 
 ## 许可证
 

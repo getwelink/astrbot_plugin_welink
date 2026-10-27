@@ -8,6 +8,7 @@ and raising on a non-zero code happens in exactly one place.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -45,6 +46,22 @@ class WeLinkClient:
     async def close(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def websocket(self, account_id: str, cursor: str | None = None):
+        """One instance per adapter; credentials stay in the handshake header."""
+        session = await self._ensure()
+        parts = urlsplit(self.base_url)
+        if parts.scheme not in ("http", "https") or parts.username or parts.password:
+            raise WeLinkError(40000, "base_url 必须是 http(s) 服务地址，不能包含登录凭据")
+        url = urlunsplit(("wss" if parts.scheme == "https" else "ws", parts.netloc,
+                         parts.path + "/accounts/" + quote(account_id, safe="") + "/ws", "", ""))
+        # ws_connect inherits the session's Bearer header. aiohttp handles
+        # protocol Ping/Pong; receive_timeout also detects silent dead sockets.
+        timeout = ({"timeout": aiohttp.ClientWSTimeout(ws_receive=75)}
+                   if hasattr(aiohttp, "ClientWSTimeout") else {"receive_timeout": 75})
+        return session.ws_connect(url, params={"cursor": cursor} if cursor else None,
+                                  autoping=True, heartbeat=25,
+                                  max_msg_size=4 * 1024 * 1024, **timeout)
 
     async def call(
         self,
@@ -93,6 +110,7 @@ class WeLinkClient:
         account_id: str | None = None,
         cursor: str | None = None,
         since: str | None = None,
+        until: str | None = None,
         limit: int = 100,
         event_type: str | None = None,
     ) -> dict[str, Any]:
@@ -103,6 +121,7 @@ class WeLinkClient:
                 "account_id": account_id,
                 "cursor": cursor,
                 "since": since,
+                "until": until,
                 "limit": limit,
                 "type": event_type,
                 "order": "oldest",

@@ -1,10 +1,7 @@
 """WeLink platform adapter: a personal WeChat account as an AstrBot channel.
 
-It polls instead of taking a callback. That is deliberate — most people run
-AstrBot at home or in a container with no address the outside world can
-reach, and polling removes that requirement entirely. The cost is one HTTP
-request per interval, which the platform answers from an indexed keyset
-query.
+New configurations use WebSocket; existing configurations without a receive
+mode keep HTTP polling. Neither mode needs an inbound public address.
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ from astrbot.core.platform.message_session import MessageSesion
 
 from .welink_client import WeLinkClient, WeLinkError
 from .welink_event import WeLinkMessageEvent
+from .welink_stream import WeLinkStream
 
 # Message kinds that carry a file rather than text.
 MEDIA_KINDS = {"image", "voice", "video", "file", "sticker"}
@@ -137,11 +135,12 @@ KIND_LABEL = {
 
 @register_platform_adapter(
     "welink",
-    "WeLink 微信个人号适配器，通过轮询获取消息，不需要公网地址",
+    "WeLink 微信个人号适配器，支持 WebSocket 实时推送和 HTTP 轮询，无需公网地址",
     default_config_tmpl={
         "base_url": "",
         "api_key": "",
         "account_id": "",
+        "receive_mode": "websocket",
         "poll_interval": 3,
         "poll_limit": 100,
         "download_image": True,
@@ -164,6 +163,8 @@ class WeLinkPlatformAdapter(Platform):
         self.base_url = str(platform_config.get("base_url", "")).strip()
         self.api_key = str(platform_config.get("api_key", "")).strip()
         self.account_id = str(platform_config.get("account_id", "")).strip()
+        # Absent in 0.1.x configs: preserve their working polling setup.
+        self.receive_mode = str(platform_config.get("receive_mode", "polling")).strip().lower()
         self.poll_interval = max(1, int(platform_config.get("poll_interval", 3) or 3))
         self.poll_limit = min(200, max(1, int(platform_config.get("poll_limit", 100) or 100)))
         self.download_image = bool(platform_config.get("download_image", True))
@@ -182,6 +183,7 @@ class WeLinkPlatformAdapter(Platform):
         self._self_names: set[str] = set()
         self._paused_until: dict[str, float] = {}
         self._stop = asyncio.Event()
+        self._stream: WeLinkStream | None = None
 
     # --- lifecycle --------------------------------------------------------
 
@@ -199,6 +201,8 @@ class WeLinkPlatformAdapter(Platform):
 
     async def terminate(self) -> None:
         self._stop.set()
+        if self._stream is not None:
+            await self._stream.close()
         await self.client.close()
         logger.info("WeLink 适配器已关闭")
 
@@ -209,6 +213,18 @@ class WeLinkPlatformAdapter(Platform):
             return
 
         if not await self._pick_account():
+            return
+
+        if self.receive_mode not in ("polling", "websocket"):
+            self.record_error("receive_mode 仅支持 websocket 或 polling")
+            logger.error("WeLink receive_mode 仅支持 websocket 或 polling")
+            return
+        if self.receive_mode == "websocket":
+            logger.info("WeLink 已启用 WebSocket 接收，实例 %s；请在控制台将该实例推送设为 WebSocket", self.account_id)
+            self._stream = WeLinkStream(self.client, self.account_id, self._consume_event,
+                                        self._stop, logger, self.poll_limit,
+                                        on_ready=self.clear_errors, on_error=self.record_error)
+            await self._stream.run()
             return
 
         # Start from now, so restarting the bot does not replay old chats.
@@ -292,33 +308,28 @@ class WeLinkPlatformAdapter(Platform):
         )
         items = data.get("items") or []
 
-        # The cursor only moves when something actually came back. An empty
-        # page has confirmed nothing, so moving past it would step over a
-        # message that had not arrived yet when the query ran.
-        #
-        # Where it moves to is the last event on the page. The platform says
-        # so in next_cursor, but versions before 2026-09-27 said it only for a
-        # full page: a short one came back with none, the cursor stayed put,
-        # and every poll returned the same messages — one "/help" answered
-        # every three seconds. The last event's own id is the same position,
-        # so it stands in whenever next_cursor is missing.
-        if items:
-            nxt = data.get("next_cursor") or items[-1].get("event_id")
-            if nxt:
-                self._cursor = nxt
-
+        # Advance after each successful enqueue/filter decision, never before
+        # handling a whole page. Failures remain retryable at the old position.
         for event in items:
-            if self._already_handled(event):
-                continue
-            try:
-                await self._handle(event)
-            except Exception as e:
-                logger.exception("WeLink 处理消息时出错，已跳过这条消息：%s", e)
+            await self._consume_event(event)
+            if event.get("event_id"):
+                self._cursor = event["event_id"]
 
         more = data.get("has_more")
         if more is None:
             more = len(items) >= self.poll_limit
         return bool(more)
+
+    async def _consume_event(self, event: dict[str, Any]) -> None:
+        if self._already_handled(event):
+            return
+        try:
+            await self._handle(event)
+        except BaseException:
+            # Cancelled downloads/failed enqueue must not become a successful ACK.
+            key = event.get("event_id") or (event.get("data") or {}).get("message_id")
+            self._seen.pop(key, None)
+            raise
 
     def _already_handled(self, event: dict[str, Any]) -> bool:
         """Remember each event, and say whether it has been seen before.
